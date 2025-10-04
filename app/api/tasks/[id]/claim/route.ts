@@ -1,66 +1,86 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { auth } from "@/lib/auth";
-import { TaskType } from "@prisma/client";
-data: { type: someValue as TaskType }
+import { TaskStatus } from "@prisma/client";
+import { getSessionUserId, unauthorizedJson } from "@/lib/session";
 
+type RouteParams = { params: { id: string } };
 
+async function sendWebhook(payload: any) {
+  const url = process.env.CLAIM_WEBHOOK_URL;
+  if (!url) return { ok: false, skipped: true };
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return { ok: res.ok, status: res.status };
+}
 
-export async function POST(
-  req: Request,
-  { params }: { params: { id: string } }
-) {
-  const session = await auth();
-  if (!session?.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+export async function POST(req: Request, { params }: RouteParams) {
+  try {
+    const userId = await getSessionUserId();
+    if (!userId) return NextResponse.json(unauthorizedJson(), { status: 401 });
 
-  const form = await req.formData(); // from edit page form
-  const type = String(form.get("type") || "");
-  const tweetUrl = String(form.get("tweetUrl") || "");
-  const rewardPoints = Number(form.get("rewardPoints") || 0);
-  const maxClaims = Number(form.get("maxClaims") || 0);
-
-  const task = await prisma.task.findUnique({ where: { id: params.id } });
-  if (!task || task.creatorId !== (session.user as any).id) {
-    return NextResponse.json({ error: "Not found" }, { status: 404 });
-  }
-
-  // hitung perubahan kuota untuk escrow (naik/turun)
-  const used = (task as any).claimsCount ?? 0;
-  if (maxClaims < used) {
-    return NextResponse.json({ error: `maxClaims < used (${used})` }, { status: 400 });
-  }
-
-  // jika reward atau maxClaims berubah, sesuaikan escrow
-  // escrow baru yang dibutuhkan untuk sisa slot:
-  const oldRemaining = task.maxClaims - used;
-  const newRemaining = maxClaims - used;
-  const oldNeed = oldRemaining * task.rewardPoints;
-  const newNeed = newRemaining * rewardPoints;
-  let delta = newNeed - oldNeed; // >0: butuh tambah escrow; <0: refund
-
-  // transaksi kecil: update task + saldo user bila perlu
-  await prisma.$transaction(async (tx) => {
-    if (delta > 0) {
-      // tarik dari saldo user
-      await tx.user.update({
-        where: { id: task.creatorId },
-        data: { points: { decrement: delta } },
-      });
-    } else if (delta < 0) {
-      await tx.user.update({
-        where: { id: task.creatorId },
-        data: { points: { increment: -delta } },
-      });
+    // Terima JSON atau Form
+    let proofUrl = "";
+    const ct = req.headers.get("content-type") || "";
+    if (ct.includes("application/json")) {
+      const body = await req.json().catch(() => ({}));
+      proofUrl = body?.proofUrl ?? "";
+    } else {
+      const form = await req.formData().catch(() => null);
+      proofUrl = (form?.get("proofUrl") as string) || "";
     }
 
-    await tx.task.update({
-      where: { id: task.id },
-      data: {
-        type, tweetUrl, rewardPoints, maxClaims,
-        escrow: Math.max(0, (task.escrow ?? 0) + delta),
+    const task = await prisma.task.findUnique({
+      where: { id: params.id },
+      select: {
+        id: true, status: true, maxClaims: true, claimsCount: true,
+        rewardPoints: true, tweetUrl: true,
       },
     });
-  });
+    if (!task) return NextResponse.json({ ok: false, message: "Task not found" }, { status: 404 });
 
-  return NextResponse.redirect(new URL("/my", req.url));
+    if (task.status !== TaskStatus.ACTIVE) {
+      return NextResponse.json({ ok: false, code: "INACTIVE", message: "Task is not active" }, { status: 200 });
+    }
+    // (opsional) tahan spam jika penuh
+    if (task.claimsCount >= task.maxClaims) {
+      return NextResponse.json({ ok: false, code: "FULL", message: "Task claim capacity reached" }, { status: 200 });
+    }
+
+    // Pastikan user ada
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+
+    // Notif keluar (tanpa tulis Claim)
+    await sendWebhook({
+      type: "task_claim_notification",
+      taskId: task.id, userId, proofUrl,
+      tweetUrl: task.tweetUrl, rewardPoints: task.rewardPoints,
+      at: new Date().toISOString(),
+    });
+
+    // Increment points beneran di DB
+    const updated = await prisma.user.update({
+      where: { id: userId },
+      data: { points: { increment: task.rewardPoints } },
+      select: { points: true },
+    });
+
+    return NextResponse.json({
+      ok: true,
+      code: "NOTIFIED_ONLY",
+      message: "Claim received (not saved). Points added.",
+      data: {
+        taskId: task.id,
+        userId,
+        proofUrl,
+        reward: task.rewardPoints,
+        newPoints: updated.points, // saldo baru
+      },
+    });
+  } catch (err: any) {
+    console.error("claim notify-only error:", err);
+    return NextResponse.json({ ok: false, code: "ERROR", message: err?.message ?? "Internal error" }, { status: 200 });
+  }
 }

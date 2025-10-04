@@ -1,34 +1,65 @@
-
+// app/api/claims/[id]/approve/route.ts
 import { NextResponse } from "next/server";
-import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { ClaimStatus, TaskStatus } from "@prisma/client";
+import { getSessionUserId, unauthorizedJson } from "@/lib/session";
 
-export async function POST(req: Request, { params }: { params: { id: string } }) {
-  const session = await auth();
-  if (!session?.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  const userId = (session.user as any).id;
-  const claimId = params.id;
+type RouteParams = { params: { id: string } };
 
-  const res = await prisma.$transaction(async (tx) => {
-    const claim = await tx.claim.findUnique({ where: { id: claimId }, include: { task: true } });
-    if (!claim) throw new Error("Claim not found");
-    if (claim.status !== "PENDING") throw new Error("Already handled");
-    if (claim.task.creatorId !== userId) throw new Error("Only task owner can approve");
-    if (claim.task.escrow < claim.task.rewardPoints) throw new Error("Escrow insufficient");
-
-    // pay worker: move points from task escrow to worker
-    await tx.claim.update({ where: { id: claimId }, data: { status: "APPROVED" } });
-    await tx.user.update({ where: { id: claim.workerId }, data: { points: { increment: claim.task.rewardPoints } } });
-    await tx.task.update({ where: { id: claim.taskId }, data: { escrow: { decrement: claim.task.rewardPoints } } });
-
-    // if escrow emptied and all claims handled, consider status update
-    const t = await tx.task.findUnique({ where: { id: claim.taskId } });
-    if (t && t.escrow === 0) {
-      await tx.task.update({ where: { id: t.id }, data: { status: "COMPLETED" } });
+export async function POST(_req: Request, { params }: RouteParams) {
+  try {
+    const userId = await getSessionUserId();
+    if (!userId) {
+      return NextResponse.json(unauthorizedJson(), { status: 401 });
     }
-    return { ok: true };
-  }).catch((e) => ({ error: e.message }));
 
-  if ("error" in res) return NextResponse.json(res, { status: 400 });
-  return NextResponse.redirect(new URL(`/my`, req.url));
+    const claim = await prisma.claim.findUnique({
+      where: { id: params.id },
+      include: { task: true, worker: true },
+    });
+    if (!claim) return NextResponse.json({ error: "Claim not found" }, { status: 404 });
+    if (!claim.task) return NextResponse.json({ error: "Task not found" }, { status: 404 });
+
+    // hanya creator task yang boleh approve
+    if (claim.task.creatorId !== userId) {
+      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+    }
+
+    // === gunakan enum status yang ada di DB kamu (ACTIVE) ===
+    if (claim.task.status !== TaskStatus.ACTIVE) {
+      return NextResponse.json({ error: "Task is not active" }, { status: 400 });
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+      const approved = await tx.claim.update({
+        where: { id: claim.id },
+        data: { status: ClaimStatus.APPROVED },
+        include: { task: true },
+      });
+
+      const nextCount = approved.task.claimsCount + 1;
+      const shouldClose = nextCount >= approved.task.maxClaims;
+
+      const updatedTask = await tx.task.update({
+        where: { id: approved.taskId },
+        data: {
+          claimsCount: { increment: 1 },
+          status: shouldClose ? TaskStatus.CLOSED : approved.task.status,
+        },
+        select: { status: true },
+      });
+
+      return { updatedTask };
+    });
+
+    return NextResponse.json({
+      ok: true,
+      claimId: claim.id,
+      taskId: claim.taskId,
+      taskStatus: result.updatedTask.status,
+    });
+  } catch (err: any) {
+    console.error("approve claim error:", err);
+    return NextResponse.json({ error: err?.message ?? "Internal error" }, { status: 500 });
+  }
 }

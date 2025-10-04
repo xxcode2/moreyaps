@@ -1,4 +1,5 @@
-
+// prisma/schema.prisma
+// ============= Generators & Datasource =============
 generator client {
   provider = "prisma-client-js"
 }
@@ -6,65 +7,22 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
+  // Untuk Data Proxy, cukup pakai db push (tanpa shadow DB)
 }
 
-model User {
-  id        String   @id @default(cuid())
-  name      String?
-  email     String?  @unique
-  password  String?          // <— WAJIB ADA
-  image     String?
-  points    Int      @default(500)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  accounts  Account[]
-  sessions  Session[]
-  tasks     Task[]    @relation("UserTasks")
-  claims    Claim[]
-}
-
-model Task {
-  id            String   @id @default(cuid())
-  type          TaskType
-  tweetUrl      String
-  rewardPoints  Int
-  maxClaims     Int
-  claimsCount   Int      @default(0)
-  escrow        Int      @default(0)
-  status        TaskStatus @default(ACTIVE)
-  creator       User     @relation("UserTasks", fields: [creatorId], references: [id])
-  creatorId     String
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-
-  claims        Claim[]
-}
-
-model Claim {
-  id         String   @id @default(cuid())
-  task       Task     @relation(fields: [taskId], references: [id])
-  taskId     String
-  worker     User     @relation(fields: [workerId], references: [id])
-  workerId   String
-  proofUrl   String
-  status     ClaimStatus @default(PENDING)
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-}
-
+// =================== Enums =========================
 enum TaskType {
   FOLLOW
-  LIKE
-  RETWEET
   REPLY
+  RETWEET
+  LIKE
   QUOTE
 }
 
 enum TaskStatus {
   ACTIVE
-  PAUSED
-  COMPLETED
+  CLOSED
+  DRAFT
 }
 
 enum ClaimStatus {
@@ -73,38 +31,99 @@ enum ClaimStatus {
   REJECTED
 }
 
-// NextAuth models
+// =================== Core Models ===================
+model User {
+  id             String   @id @default(cuid())
+  name           String?
+  email          String?  @unique
+  emailVerified  DateTime?
+  image          String?
+
+  // saldo poin
+  points         Int      @default(0)
+
+  // next-auth relations
+  accounts       Account[]
+  sessions       Session[]
+
+  // app relations
+  tasks          Task[]   @relation("UserTasks")   // tasks yang dibuat user ini (creator)
+  claims         Claim[]  @relation("UserClaims")  // claims yang dikerjakan user ini (worker)
+}
+
+model Task {
+  id           String      @id @default(cuid())
+  type         TaskType
+  tweetUrl     String
+  rewardPoints Int
+  maxClaims    Int
+  claimsCount  Int         @default(0)
+  escrow       Int         @default(0)
+  status       TaskStatus
+
+  // creator
+  creatorId    String
+  creator      User        @relation("UserTasks", fields: [creatorId], references: [id], onDelete: Cascade)
+
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  // claims untuk task ini
+  claims       Claim[]
+}
+
+model Claim {
+  id         String       @id @default(cuid())
+
+  // relasi ke task
+  taskId     String
+  task       Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  // relasi ke user (worker) — pasangan dari User.claims @relation("UserClaims")
+  workerId   String
+  worker     User         @relation("UserClaims", fields: [workerId], references: [id], onDelete: Cascade)
+
+  proofUrl   String
+  status     ClaimStatus
+
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+}
+
+// =============== NextAuth (v4/v5) ==================
 model Account {
-  id                String  @id @default(cuid())
-  userId            String
-  type              String
-  provider          String
-  providerAccountId String
-  refresh_token     String? @db.Text
-  access_token      String? @db.Text
-  expires_at        Int?
-  token_type        String?
-  scope             String?
-  id_token          String? @db.Text
-  session_state     String?
+  userId                 String
+  type                   String
+  provider               String
+  providerAccountId      String
+  refresh_token          String?
+  access_token           String?
+  expires_at             Int?
+  token_type             String?
+  scope                  String?
+  id_token               String?
+  session_state          String?
+  oauth_token_secret     String?
+  oauth_token            String?
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user                   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@unique([provider, providerAccountId])
+  @@id([provider, providerAccountId])
 }
 
 model Session {
-  id           String   @id @default(cuid())
-  sessionToken String   @unique
-  userId       String
-  expires      DateTime
+  id            String   @id @default(cuid())
+  sessionToken  String   @unique
+  userId        String
+  expires       DateTime
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 model VerificationToken {
-  identifier String
-  token      String   @unique
-  expires    DateTime
+  identifier   String
+  token        String   @unique
+  expires      DateTime
+
   @@unique([identifier, token])
 }

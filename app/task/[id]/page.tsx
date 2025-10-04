@@ -1,71 +1,91 @@
 import { prisma } from "@/lib/prisma";
-import { auth } from "@/lib/auth";
-import { notFound } from "next/navigation";
-import Link from "next/link";
+import { getSessionUserId } from "@/lib/session";
+import ClaimFormClient from "./ClaimFormClient";
+import SubmitProof from "@/components/SubmitProof";
 
-export default async function TaskDetail({ params }: { params: { id: string } }) {
-  const session = await auth();
-  const me = session?.user as any | undefined;
+type Props = { params: { id: string } };
 
-  const t = await prisma.task.findUnique({
-    where: { id: params.id },
-    include: {
-      _count: { select: { claims: true } },
-      creator: { select: { id: true, name: true } }
-    }
-  });
-  if (!t) return notFound();
+export default async function TaskPage({ params }: Props) {
+  const [task, userId] = await Promise.all([
+    prisma.task.findUnique({
+      where: { id: params.id },
+      select: {
+        id: true, type: true, tweetUrl: true, rewardPoints: true,
+        maxClaims: true, claimsCount: true, status: true,
+      },
+    }),
+    getSessionUserId(),
+  ]);
 
-  const used = t._count.claims;
-  const left = Math.max(0, t.maxClaims - used);
-  const isOwner = me?.id === t.creatorId;
-
-  return (
-    <div className="space-y-6">
-      {/* Hero */}
-      <div className="card">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <div className="text-xs text-slate-400 capitalize">{t.type.toLowerCase()} task by {t.creator?.name ?? "user"}</div>
-            <h1 className="text-xl font-semibold mt-1">{t.type.toLowerCase()} task by YapTasks</h1>
-            <div className="text-sm mt-2">
-              <span className="text-slate-400">Tweet URL: </span>
-              <a href={t.tweetUrl} className="text-cyan-300 break-all" target="_blank">{t.tweetUrl}</a>
-            </div>
-            <div className="text-xs text-slate-400 mt-1">Slots left: {left} / {t.maxClaims}</div>
-            <div className="progress mt-2"><i style={{ width: `${(used / t.maxClaims) * 100}%` }} /></div>
-          </div>
-          <div className="text-sm"><span className="star">⭐</span> {t.rewardPoints} / claim</div>
+  if (!task) {
+    return (
+      <div className="max-w-4xl mx-auto p-6">
+        <div className="rounded-2xl border p-6 bg-red-50 border-red-200 text-red-700">
+          Task not found
         </div>
       </div>
+    );
+  }
 
-      {/* Kalau BUKAN owner -> form claim. Kalau owner -> panel manage */}
-      {!isOwner ? (
-        <div className="card">
-          <h2 className="font-semibold mb-2">Submit Proof</h2>
-          <p className="text-sm text-slate-400 mb-3">Proof URL (your like/retweet/reply link or profile for follow)</p>
-          <form action={`/api/tasks/${t.id}/claim`} method="post" className="flex items-center gap-3">
-            <input name="proofUrl" required placeholder="https://x.com/yourname/status/..." className="input input-lg flex-1" />
-            <button className="btn btn-cta px-5">Claim</button>
-          </form>
-          <p className="text-xs text-slate-500 mt-3">
-            Auto-verification via X API is optional; by default, creator reviews claims.
-          </p>
-        </div>
-      ) : (
-        <div className="card">
-          <h2 className="font-semibold mb-2">Manage Task</h2>
-          <div className="flex flex-wrap gap-2">
-            <Link href={`/my/edit/${t.id}`} className="btn btn-ghost">Edit</Link>
-            {t.status === "ACTIVE" && (
-              <form action={`/api/tasks/${t.id}/cancel`} method="post">
-                <button className="btn border-red-400/40 text-red-300 hover:bg-red-500/10">Cancel</button>
-              </form>
-            )}
-            <Link href="/my" className="btn">Back to My Tasks</Link>
+  let points: number | null = null;
+  if (userId) {
+    const u = await prisma.user.findUnique({ where: { id: userId }, select: { points: true } });
+    points = u?.points ?? 0;
+  }
+
+  return (
+    <div className="max-w-4xl mx-auto p-6">
+      <div className="rounded-3xl border shadow-sm overflow-hidden bg-gradient-to-br from-slate-50 to-white">
+        <div className="p-6 md:p-8">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h1 className="text-2xl md:text-3xl font-bold tracking-tight">{task.id}</h1>
+              <p className="text-sm text-slate-500 mt-1">Type: {task.type}</p>
+            </div>
+            <div className="text-right">
+              <div className="text-xs text-slate-500">Status</div>
+              <div className="inline-flex items-center rounded-full bg-emerald-50 px-3 py-1 text-emerald-700 border border-emerald-200 text-xs font-medium">
+                {task.status}
+              </div>
+            </div>
           </div>
+
+          <div className="mt-6 grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+            <div className="rounded-xl border bg-white p-4">
+              <div className="text-slate-500 text-xs">Reward</div>
+              <div className="text-lg font-semibold">{task.rewardPoints}</div>
+            </div>
+            <div className="rounded-xl border bg-white p-4">
+              <div className="text-slate-500 text-xs">Claims</div>
+              <div className="text-lg font-semibold">{task.claimsCount}/{task.maxClaims}</div>
+            </div>
+            <div className="rounded-xl border bg-white p-4 col-span-2">
+              <div className="text-slate-500 text-xs">Tweet</div>
+              <a href={task.tweetUrl} target="_blank" className="text-sm text-blue-600 underline break-all">
+                {task.tweetUrl}
+              </a>
+            </div>
+          </div>
+
+          {userId && (
+            <div className="mt-6 rounded-xl border bg-white p-4 flex items-center justify-between">
+              <div className="text-sm text-slate-600">
+                Logged as <span className="font-medium">{userId}</span>
+              </div>
+              <div className="text-right">
+                <div className="text-xs text-slate-500">Your Points</div>
+                <div id="points-value" className="text-xl font-bold">{typeof points === "number" ? points : 0}</div>
+              </div>
+            </div>
+          )}
         </div>
-      )}
+
+        <ClaimFormClient taskId={task.id} reward={task.rewardPoints} />
+      </div>
+       <div>
+      {/* info task */}
+      <SubmitProof reward={10000} />
+    </div>
     </div>
   );
 }
